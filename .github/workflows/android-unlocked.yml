@@ -1,0 +1,266 @@
+# Personal Android build of Readest with the third-party cloud-sync paywall
+# (WebDAV / S3 / Google Drive / OneDrive / iCloud) unlocked for local use.
+#
+# How it works:
+#   1. Polls upstream readest/readest for its latest release tag (daily cron,
+#      or on demand via Run workflow).
+#   2. Skips everything when that exact tag was already built (marker cached
+#      by tag), so a new APK appears only when upstream ships a new release.
+#   3. Checks out UPSTREAM code at that tag — this fork does NOT need to stay
+#      synced — then re-applies the one-line unlock patch:
+#        CLOUD_SYNC_REQUIRES_PREMIUM = true -> false
+#      in apps/readest-app/src/utils/access.ts. That flag is the single gate
+#      every consumer reads through isCloudSyncAllowed (settings UI rows and
+#      the sync engine alike), so flipping it unlocks WebDAV/S3/etc. A grep
+#      right after fails fast if a future upstream rename breaks the patch.
+#   4. Builds the universal release APK with a self-signed keystore generated
+#      once and reused across runs (stable signature, so updates install over
+#      previous builds without an uninstall first).
+#
+# No repository secrets are required: the committed .env carries working
+# defaults, and the Sentry source-map upload no-ops without SENTRY_AUTH_TOKEN.
+#
+# The APK is signed with KEY_PASSWORD below; the keystore is also uploaded as
+# a backup artifact on every successful build in case the actions/cache copy
+# is ever evicted.
+
+name: Android Unlocked
+
+on:
+  schedule:
+    - cron: '17 21 * * *' # daily, off the hour to dodge runner rush
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Rebuild even if this upstream tag was already built
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-unlocked
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: readest/readest
+  NDK_VERSION: 28.2.13676358
+  KEYSTORE_DIR: .unlocked-keystore
+  BUILT_STATE_DIR: .unlocked-built-state
+  KEY_ALIAS: readest-unlocked
+  KEY_PASSWORD: readest-unlocked
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.latest.outputs.tag }}
+    steps:
+      - name: resolve latest upstream release tag
+        id: latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag=$(curl -fsSL \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${UPSTREAM_REPO}/releases/latest" | jq -er '.tag_name // empty')
+          if [ -z "$tag" ]; then
+            echo "::error::could not resolve the latest release tag of ${UPSTREAM_REPO}"
+            exit 1
+          fi
+          echo "Latest upstream release: $tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 100
+    steps:
+      # Marker cache keyed by the resolved tag: a hit means we already built
+      # and published this exact upstream release; the post-job save only
+      # stores it once this job succeeds with a fresh build.
+      - name: restore built-tag marker
+        id: state
+        if: ${{ inputs.force != true }}
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.BUILT_STATE_DIR }}
+          key: unlocked-built-${{ needs.resolve.outputs.tag }}
+
+      - name: decide whether to build
+        id: decide
+        run: |
+          if [ "${{ steps.state.outputs.cache-hit }}" = "true" ]; then
+            echo "Upstream tag ${{ needs.resolve.outputs.tag }} was already built — nothing to do."
+            echo 'should_build=false' >> "$GITHUB_OUTPUT"
+          else
+            echo "Building upstream tag ${{ needs.resolve.outputs.tag }}."
+            echo 'should_build=true' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: checkout upstream at the resolved tag
+        if: steps.decide.outputs.should_build == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ needs.resolve.outputs.tag }}
+          submodules: recursive
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: setup pnpm
+        if: steps.decide.outputs.should_build == 'true'
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+
+      - name: setup node
+        if: steps.decide.outputs.should_build == 'true'
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: setup java
+        if: steps.decide.outputs.should_build == 'true'
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
+      - name: setup android sdk
+        if: steps.decide.outputs.should_build == 'true'
+        uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4
+
+      - name: install ndk
+        if: steps.decide.outputs.should_build == 'true'
+        run: sdkmanager "ndk;${NDK_VERSION}"
+
+      - name: install dependencies
+        if: steps.decide.outputs.should_build == 'true'
+        run: pnpm install --frozen-lockfile --prefer-offline
+
+      - name: copy pdfjs-dist and simplecc-dist to public directory
+        if: steps.decide.outputs.should_build == 'true'
+        run: pnpm --filter @readest/readest-app setup-vendors
+
+      - name: install rust stable (android targets)
+        if: steps.decide.outputs.should_build == 'true'
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+
+      - name: rust cache
+        if: steps.decide.outputs.should_build == 'true'
+        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          key: android-unlocked-cargo
+
+      - name: create .env.local for Next.js
+        if: steps.decide.outputs.should_build == 'true'
+        run: |
+          echo "NEXT_PUBLIC_APP_PLATFORM=tauri" >> .env.local
+          cp .env.local apps/readest-app/.env.local
+
+      # The keystore lives in a fixed-key cache so every build signs with the
+      # SAME key and APK updates install over previous installs. If the cache
+      # entry is ever evicted a new keystore is generated (signature changes —
+      # uninstall the old app first); the backup artifact below lets you
+      # restore the original one manually.
+      - name: restore signing keystore
+        if: steps.decide.outputs.should_build == 'true'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.KEYSTORE_DIR }}
+          key: unlocked-keystore-v1
+
+      - name: generate signing keystore (first run only)
+        if: steps.decide.outputs.should_build == 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p "$KEYSTORE_DIR"
+          if [ -f "$KEYSTORE_DIR/keystore.jks" ]; then
+            echo "Reusing cached keystore."
+          else
+            echo "No cached keystore found — generating a new self-signed one."
+            keytool -genkeypair -v \
+              -keystore "$KEYSTORE_DIR/keystore.jks" \
+              -alias "$KEY_ALIAS" \
+              -keyalg RSA -keysize 2048 -validity 10950 \
+              -storepass "$KEY_PASSWORD" -keypass "$KEY_PASSWORD" \
+              -dname "CN=Readest Unlocked, OU=Personal, O=Personal, C=VN"
+          fi
+
+      # Mirrors nightly.yml's android leg. `git checkout .` after init reverts
+      # tracked files the scaffolding touched (package.json etc.), so the
+      # unlock patch MUST be applied AFTER that revert or it would be undone.
+      - name: build universal apk (init + patch + sign)
+        if: steps.decide.outputs.should_build == 'true'
+        env:
+          NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/${{ env.NDK_VERSION }}
+        run: |
+          set -euo pipefail
+          version="${{ needs.resolve.outputs.tag }}"
+          cd apps/readest-app/
+          rm -rf src-tauri/gen/android
+          pnpm tauri android init
+          pnpm tauri icon ../../data/icons/readest-book.png
+          git checkout .
+
+          # ─── unlock patch: flip the cloud-sync paywall off ───
+          sed -i \
+            's/export const CLOUD_SYNC_REQUIRES_PREMIUM = true;/export const CLOUD_SYNC_REQUIRES_PREMIUM = false;/' \
+            src/utils/access.ts
+          grep -q 'export const CLOUD_SYNC_REQUIRES_PREMIUM = false;' src/utils/access.ts || {
+            echo '::error::unlock patch did not apply — upstream changed src/utils/access.ts; update the sed pattern in this workflow'
+            exit 1
+          }
+          echo "Unlock patch applied: CLOUD_SYNC_REQUIRES_PREMIUM -> false"
+
+          pushd src-tauri/gen/android
+          {
+            echo "keyAlias=${KEY_ALIAS}"
+            echo "password=${KEY_PASSWORD}"
+            echo "storeFile=${GITHUB_WORKSPACE}/${KEYSTORE_DIR}/keystore.jks"
+          } > keystore.properties
+          popd
+
+          apk_path=src-tauri/gen/android/app/build/outputs/apk/universal/release
+          pnpm tauri android build
+          cp "${apk_path}/app-universal-release.apk" "Readest_${version}_unlocked.apk"
+          ls -lh "Readest_${version}_unlocked.apk"
+
+          mkdir -p "../../${BUILT_STATE_DIR}"
+          echo "$version" > "../../${BUILT_STATE_DIR}/built-tag.txt"
+
+      - name: upload apk artifact
+        if: steps.decide.outputs.should_build == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: Readest-${{ needs.resolve.outputs.tag }}-unlocked-android
+          path: apps/readest-app/Readest_*_unlocked.apk
+          if-no-files-found: error
+
+      - name: upload keystore backup artifact
+        if: steps.decide.outputs.should_build == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: unlocked-signing-keystore-backup
+          path: ${{ env.KEYSTORE_DIR }}/keystore.jks
+          if-no-files-found: error
+
+      - name: write job summary
+        if: steps.decide.outputs.should_build == 'true'
+        run: |
+          version="${{ needs.resolve.outputs.tag }}"
+          {
+            echo "## Readest ${version} — Android unlocked build"
+            echo ''
+            echo "- Patch applied: \`CLOUD_SYNC_REQUIRES_PREMIUM = false\` (WebDAV / S3 / Drive / OneDrive / iCloud sync unlocked)"
+            echo "- APK: \`Readest_${version}_unlocked.apk\` (universal — arm64, armv7, x86_64)"
+            echo '- Install: download from the Artifacts section above, unzip, allow "Install unknown apps", install.'
+            echo "- Signing password (store + key): \`${KEY_PASSWORD}\`, alias: \`${KEY_ALIAS}\`."
+            echo "- Keep the \`unlocked-signing-keystore-backup\` artifact if you want a stable signature across cache evictions."
+          } >> "$GITHUB_STEP_SUMMARY"
