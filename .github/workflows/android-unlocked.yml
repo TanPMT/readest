@@ -16,6 +16,8 @@
 #   4. Builds the universal release APK with a self-signed keystore generated
 #      once and reused across runs (stable signature, so updates install over
 #      previous builds without an uninstall first).
+#   5. Publishes the APK to this fork's Releases under the rolling tag
+#      `unlocked-android` (one stable download URL, updated on every build).
 #
 # No repository secrets are required: the committed .env carries working
 # defaults, and the Sentry source-map upload no-ops without SENTRY_AUTH_TOKEN.
@@ -79,6 +81,8 @@ jobs:
     needs: resolve
     runs-on: ubuntu-latest
     timeout-minutes: 100
+    permissions:
+      contents: write
     steps:
       # Marker cache keyed by the resolved tag: a hit means we already built
       # and published this exact upstream release; the post-job save only
@@ -243,6 +247,32 @@ jobs:
           path: apps/readest-app/Readest_*_unlocked.apk
           if-no-files-found: error
 
+      # Publish to THIS fork's Releases under one rolling tag so there is
+      # always a single stable download URL with the latest unlocked APK.
+      - name: publish apk to release
+        if: steps.decide.outputs.should_build == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: unlocked-android
+        run: |
+          set -euo pipefail
+          version="${{ needs.resolve.outputs.tag }}"
+          apk="apps/readest-app/Readest_${version}_unlocked.apk"
+          title="Readest ${version} — Android (WebDAV/S3 unlocked)"
+          notes="Unlocked third-party cloud sync (WebDAV / S3 / Drive / OneDrive / iCloud). Built from upstream ${UPSTREAM_REPO}@${version}."
+          notes="${notes}"$'\n\n'"- Universal APK (arm64, armv7, x86_64). Allow \"Install unknown apps\" to install."
+          notes="${notes}"$'\n\n'"Personal AGPL build — not an official Readest release."
+
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "$apk" --clobber --repo "$GITHUB_REPOSITORY"
+            gh release edit "$RELEASE_TAG" \
+              --title "$title" --notes "$notes" --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$RELEASE_TAG" "$apk" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$title" --notes "$notes"
+          fi
+
       - name: upload keystore backup artifact
         if: steps.decide.outputs.should_build == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -260,7 +290,8 @@ jobs:
             echo ''
             echo "- Patch applied: \`CLOUD_SYNC_REQUIRES_PREMIUM = false\` (WebDAV / S3 / Drive / OneDrive / iCloud sync unlocked)"
             echo "- APK: \`Readest_${version}_unlocked.apk\` (universal — arm64, armv7, x86_64)"
-            echo '- Install: download from the Artifacts section above, unzip, allow "Install unknown apps", install.'
+            echo "- Published to: https://github.com/${GITHUB_REPOSITORY}/releases/tag/unlocked-android"
+            echo '- Install: grab the APK from the release above or the Artifacts section, unzip, allow "Install unknown apps", install.'
             echo "- Signing password (store + key): \`${KEY_PASSWORD}\`, alias: \`${KEY_ALIAS}\`."
             echo "- Keep the \`unlocked-signing-keystore-backup\` artifact if you want a stable signature across cache evictions."
           } >> "$GITHUB_STEP_SUMMARY"
