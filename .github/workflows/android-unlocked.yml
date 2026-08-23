@@ -13,9 +13,10 @@
 #      every consumer reads through isCloudSyncAllowed (settings UI rows and
 #      the sync engine alike), so flipping it unlocks WebDAV/S3/etc. A grep
 #      right after fails fast if a future upstream rename breaks the patch.
-#   4. Builds the universal release APK with a self-signed keystore generated
-#      once and reused across runs (stable signature, so updates install over
-#      previous builds without an uninstall first).
+#   4. Builds the arm64-v8a release APK (single-ABI for speed) with a
+#      self-signed keystore generated once and reused across runs (stable
+#      signature, so updates install over previous builds without an
+#      uninstall first).
 #   5. Publishes the APK to this fork's Releases under the rolling tag
 #      `unlocked-android` (one stable download URL, updated on every build).
 #
@@ -150,11 +151,11 @@ jobs:
         if: steps.decide.outputs.should_build == 'true'
         run: pnpm --filter @readest/readest-app setup-vendors
 
-      - name: install rust stable (android targets)
+      - name: install rust stable (android arm64 target)
         if: steps.decide.outputs.should_build == 'true'
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
-          targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+          targets: aarch64-linux-android
 
       - name: rust cache
         if: steps.decide.outputs.should_build == 'true'
@@ -200,7 +201,7 @@ jobs:
       # Mirrors nightly.yml's android leg. `git checkout .` after init reverts
       # tracked files the scaffolding touched (package.json etc.), so the
       # unlock patch MUST be applied AFTER that revert or it would be undone.
-      - name: build universal apk (init + patch + sign)
+      - name: build arm64 apk (init + patch + sign)
         if: steps.decide.outputs.should_build == 'true'
         env:
           NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/${{ env.NDK_VERSION }}
@@ -232,9 +233,15 @@ jobs:
           popd
 
           apk_path=src-tauri/gen/android/app/build/outputs/apk/universal/release
-          pnpm tauri android build
-          cp "${apk_path}/app-universal-release.apk" "Readest_${version}_unlocked.apk"
-          ls -lh "Readest_${version}_unlocked.apk"
+          # arm64-only: cross-compiling Rust is the single biggest cost of
+          # this job, and every phone from ~2015 on is arm64-v8a. Dropping
+          # the other three ABIs cuts the build time roughly in half and
+          # shrinks the APK. Flip back to plain `pnpm tauri android build`
+          # for a 4-ABI universal APK (also needs all four rust targets
+          # re-added to the toolchain step above).
+          pnpm tauri android build -t aarch64
+          cp "${apk_path}/app-universal-release.apk" "Readest_${version}_unlocked_arm64.apk"
+          ls -lh "Readest_${version}_unlocked_arm64.apk"
 
           mkdir -p "../../${BUILT_STATE_DIR}"
           echo "$version" > "../../${BUILT_STATE_DIR}/built-tag.txt"
@@ -244,7 +251,7 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: Readest-${{ needs.resolve.outputs.tag }}-unlocked-android
-          path: apps/readest-app/Readest_*_unlocked.apk
+          path: apps/readest-app/Readest_*_unlocked_arm64.apk
           if-no-files-found: error
 
       # Publish to THIS fork's Releases under one rolling tag so there is
@@ -257,10 +264,10 @@ jobs:
         run: |
           set -euo pipefail
           version="${{ needs.resolve.outputs.tag }}"
-          apk="apps/readest-app/Readest_${version}_unlocked.apk"
-          title="Readest ${version} — Android (WebDAV/S3 unlocked)"
+          apk="apps/readest-app/Readest_${version}_unlocked_arm64.apk"
+          title="Readest ${version} — Android arm64 (WebDAV/S3 unlocked)"
           notes="Unlocked third-party cloud sync (WebDAV / S3 / Drive / OneDrive / iCloud). Built from upstream ${UPSTREAM_REPO}@${version}."
-          notes="${notes}"$'\n\n'"- Universal APK (arm64, armv7, x86_64). Allow \"Install unknown apps\" to install."
+          notes="${notes}"$'\n\n'"- arm64-v8a APK (every phone from ~2015 on). Allow \"Install unknown apps\" to install."
           notes="${notes}"$'\n\n'"Personal AGPL build — not an official Readest release."
 
           if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
@@ -289,7 +296,7 @@ jobs:
             echo "## Readest ${version} — Android unlocked build"
             echo ''
             echo "- Patch applied: \`CLOUD_SYNC_REQUIRES_PREMIUM = false\` (WebDAV / S3 / Drive / OneDrive / iCloud sync unlocked)"
-            echo "- APK: \`Readest_${version}_unlocked.apk\` (universal — arm64, armv7, x86_64)"
+            echo "- APK: \`Readest_${version}_unlocked_arm64.apk\` (arm64-v8a)"
             echo "- Published to: https://github.com/${GITHUB_REPOSITORY}/releases/tag/unlocked-android"
             echo '- Install: grab the APK from the release above or the Artifacts section, unzip, allow "Install unknown apps", install.'
             echo "- Signing password (store + key): \`${KEY_PASSWORD}\`, alias: \`${KEY_ALIAS}\`."
