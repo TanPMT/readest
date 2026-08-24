@@ -180,7 +180,7 @@ jobs:
           # NOTE: patching project.yml is pointless here — `tauri ios build`
           # does NOT re-run xcodegen; it uses the committed .pbxproj as-is.
           rm -rf src-tauri/gen/apple/build
-          pnpm tauri ios build --target aarch64-apple-ios --no-sign || \
+          pnpm tauri ios build --target aarch64 --no-sign || \
             echo "::warning::tauri ios build exited non-zero — packaging the archive manually"
 
           out_ipa="Readest_${version}_unlocked_ios_arm64.ipa"
