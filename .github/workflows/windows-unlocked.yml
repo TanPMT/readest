@@ -1,0 +1,229 @@
+# Personal Windows build of Readest with the third-party cloud-sync paywall
+# (WebDAV / S3 / Google Drive / OneDrive / iCloud) unlocked for local use.
+#
+# Mirrors android-unlocked.yml:
+#   1. Polls upstream readest/readest for its latest release tag (daily cron,
+#      or on demand via Run workflow).
+#   2. Skips everything when that exact tag was already built (marker cached
+#      by tag), so a new installer appears only when upstream ships a new
+#      release.
+#   3. Checks out UPSTREAM code at that tag — this fork does NOT need to stay
+#      synced — then re-applies the one-line unlock patch:
+#        CLOUD_SYNC_REQUIRES_PREMIUM = true -> false
+#      in apps/readest-app/src/utils/access.ts. A grep right after fails fast
+#      if a future upstream rename breaks the patch.
+#   4. Builds the x64 NSIS installer (single-arch for speed). No Authenticode
+#      certificate is configured, so SmartScreen may warn on first run:
+#      "More info" -> "Run anyway".
+#   5. Publishes the installer to this fork's Releases under the rolling tag
+#      `unlocked-windows` (one stable download URL, updated on every build).
+#
+# No repository secrets are required: the committed .env carries working
+# defaults, and the Sentry source-map upload no-ops without SENTRY_AUTH_TOKEN.
+
+name: Windows Unlocked
+
+on:
+  schedule:
+    - cron: '23 21 * * *' # daily, off the hour to dodge runner rush
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Rebuild even if this upstream tag was already built
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-unlocked
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: readest/readest
+  BUILT_STATE_DIR: .unlocked-built-state
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.latest.outputs.tag }}
+    steps:
+      - name: resolve latest upstream release tag
+        id: latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag=$(curl -fsSL \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${UPSTREAM_REPO}/releases/latest" | jq -er '.tag_name // empty')
+          if [ -z "$tag" ]; then
+            echo "::error::could not resolve the latest release tag of ${UPSTREAM_REPO}"
+            exit 1
+          fi
+          echo "Latest upstream release: $tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: resolve
+    runs-on: windows-latest
+    timeout-minutes: 100
+    permissions:
+      contents: write
+    steps:
+      # Marker cache keyed by the resolved tag: a hit means we already built
+      # and published this exact upstream release; the post-job save only
+      # stores it once this job succeeds with a fresh build.
+      - name: restore built-tag marker
+        id: state
+        if: ${{ inputs.force != true }}
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.BUILT_STATE_DIR }}
+          key: unlocked-built-windows-${{ needs.resolve.outputs.tag }}
+
+      - name: decide whether to build
+        id: decide
+        shell: bash
+        run: |
+          if [ "${{ steps.state.outputs.cache-hit }}" = "true" ]; then
+            echo "Upstream tag ${{ needs.resolve.outputs.tag }} was already built — nothing to do."
+            echo 'should_build=false' >> "$GITHUB_OUTPUT"
+          else
+            echo "Building upstream tag ${{ needs.resolve.outputs.tag }}."
+            echo 'should_build=true' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: checkout upstream at the resolved tag
+        if: steps.decide.outputs.should_build == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ needs.resolve.outputs.tag }}
+          submodules: recursive
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: setup pnpm
+        if: steps.decide.outputs.should_build == 'true'
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+
+      - name: setup node
+        if: steps.decide.outputs.should_build == 'true'
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: install dependencies
+        if: steps.decide.outputs.should_build == 'true'
+        shell: bash
+        run: pnpm install --frozen-lockfile --prefer-offline
+
+      - name: copy pdfjs-dist and simplecc-dist to public directory
+        if: steps.decide.outputs.should_build == 'true'
+        shell: bash
+        run: pnpm --filter @readest/readest-app setup-vendors
+
+      - name: install rust stable (msvc x64 target)
+        if: steps.decide.outputs.should_build == 'true'
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: rust cache
+        if: steps.decide.outputs.should_build == 'true'
+        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          key: windows-unlocked-cargo
+
+      - name: create .env.local for Next.js
+        if: steps.decide.outputs.should_build == 'true'
+        shell: bash
+        run: |
+          echo "NEXT_PUBLIC_APP_PLATFORM=tauri" >> .env.local
+          cp .env.local apps/readest-app/.env.local
+
+      - name: apply unlock patch and build nsis installer
+        if: steps.decide.outputs.should_build == 'true'
+        shell: bash
+        env:
+          NODE_OPTIONS: '--max-old-space-size=8192'
+        run: |
+          set -euo pipefail
+          version="${{ needs.resolve.outputs.tag }}"
+
+          # ─── unlock patch: flip the cloud-sync paywall off ───
+          sed -i \
+            's/export const CLOUD_SYNC_REQUIRES_PREMIUM = true;/export const CLOUD_SYNC_REQUIRES_PREMIUM = false;/' \
+            apps/readest-app/src/utils/access.ts
+          grep -q 'export const CLOUD_SYNC_REQUIRES_PREMIUM = false;' apps/readest-app/src/utils/access.ts || {
+            echo '::error::unlock patch did not apply — upstream changed src/utils/access.ts; update the sed pattern in this workflow'
+            exit 1
+          }
+          echo "Unlock patch applied: CLOUD_SYNC_REQUIRES_PREMIUM -> false"
+
+          cd apps/readest-app/
+          pnpm tauri build --target x86_64-pc-windows-msvc --bundles nsis
+
+          # Cargo WORKSPACE: bundles land in the REPO-ROOT target/ dir, not
+          # apps/readest-app/src-tauri/target/.
+          nsis=$(ls ../../target/x86_64-pc-windows-msvc/release/bundle/nsis/Readest_*_x64-setup.exe | head -n1)
+          cp "$nsis" "../../Readest_${version}_unlocked_windows_x64_setup.exe"
+          ls -lh "../../Readest_${version}_unlocked_windows_x64_setup.exe"
+
+          mkdir -p "../../${BUILT_STATE_DIR}"
+          echo "$version" > "../../${BUILT_STATE_DIR}/built-tag.txt"
+
+      - name: upload installer artifact
+        if: steps.decide.outputs.should_build == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: Readest-${{ needs.resolve.outputs.tag }}-unlocked-windows
+          path: Readest_${{ needs.resolve.outputs.tag }}_unlocked_windows_x64_setup.exe
+          if-no-files-found: error
+
+      # Publish to THIS fork's Releases under one rolling tag so there is
+      # always a single stable download URL with the latest unlocked installer.
+      - name: publish installer to release
+        if: steps.decide.outputs.should_build == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: unlocked-windows
+        run: |
+          set -euo pipefail
+          version="${{ needs.resolve.outputs.tag }}"
+          exe="Readest_${version}_unlocked_windows_x64_setup.exe"
+          title="Readest ${version} — Windows x64 (WebDAV/S3 unlocked)"
+          notes="Unlocked third-party cloud sync (WebDAV / S3 / Drive / OneDrive / iCloud). Built from upstream ${UPSTREAM_REPO}@${version}."
+          notes="${notes}"$'\n\n'"- x64 NSIS installer. SmartScreen may warn (unsigned): \"More info\" -> \"Run anyway\"."
+          notes="${notes}"$'\n\n'"Personal AGPL build — not an official Readest release."
+
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "$exe" --clobber --repo "$GITHUB_REPOSITORY"
+            gh release edit "$RELEASE_TAG" \
+              --title "$title" --notes "$notes" --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$RELEASE_TAG" "$exe" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$title" --notes "$notes"
+          fi
+
+      - name: write job summary
+        if: steps.decide.outputs.should_build == 'true'
+        shell: bash
+        run: |
+          version="${{ needs.resolve.outputs.tag }}"
+          {
+            echo "## Readest ${version} — Windows unlocked build"
+            echo ''
+            echo "- Patch applied: \`CLOUD_SYNC_REQUIRES_PREMIUM = false\` (WebDAV / S3 / Drive / OneDrive / iCloud sync unlocked)"
+            echo "- Installer: \`Readest_${version}_unlocked_windows_x64_setup.exe\` (x64 NSIS, unsigned)"
+            echo '- SmartScreen may warn on first run: click "More info" then "Run anyway".'
+            echo "- Published to: https://github.com/${GITHUB_REPOSITORY}/releases/tag/unlocked-windows"
+          } >> "$GITHUB_STEP_SUMMARY"
