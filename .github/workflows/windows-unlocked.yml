@@ -167,6 +167,10 @@ jobs:
           }
           echo "Unlock patch applied: CLOUD_SYNC_REQUIRES_PREMIUM -> false"
 
+          # This personal build has no signing key. Disable updater artifact
+          # generation so tauri doesn't require TAURI_SIGNING_PRIVATE_KEY.
+          node -e "const fs=require('fs'); const p='apps/readest-app/src-tauri/tauri.conf.json'; const c=JSON.parse(fs.readFileSync(p,'utf8')); c.bundle.createUpdaterArtifacts=false; fs.writeFileSync(p, JSON.stringify(c, null, 2)+'\n')"
+
           cd apps/readest-app/
           pnpm tauri build --target x86_64-pc-windows-msvc --bundles nsis
 
