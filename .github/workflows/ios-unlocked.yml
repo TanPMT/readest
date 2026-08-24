@@ -12,19 +12,17 @@
 #        a. CLOUD_SYNC_REQUIRES_PREMIUM = true -> false in
 #           apps/readest-app/src/utils/access.ts (the same one-line unlock as
 #           the other workflows), verified with a grep.
-#        b. CODE_SIGNING_ALLOWED=NO / CODE_SIGN_IDENTITY="" in
-#           src-tauri/gen/apple/project.yml, so the archive builds without an
-#           Apple Developer account. The patch goes into project.yml — the
-#           xcodegen SOURCE — because tauri regenerates the .pbxproj from it
-#           on every build; patching the pbxproj would be overwritten.
+#        b. Builds with `tauri ios build --no-sign`, which passes
+#           CODE_SIGNING_ALLOWED=NO / CODE_SIGN_IDENTITY="" to xcodebuild and
+#           packages the unsigned IPA itself from the .xcarchive — no Apple
+#           Developer account needed.
 #      Unlike Android, gen/apple is NOT regenerated from scratch: upstream's
 #      committed Xcode project carries their ShareExtension/Widget targets,
 #      which `tauri ios init` would wipe.
-#   4. Builds the arm64 device target. tauri's export stage may abort on
-#      missing signing certificates even with signing disabled — the archive
-#      completes first, so the step tolerates a non-zero exit and packages
-#      the unsigned IPA itself from the .xcarchive (Payload zip). It fails
-#      hard if no archive was produced at all.
+#   4. If the tauri-managed packaging still fails for any reason, the step
+#      tolerates a non-zero exit and packages the unsigned IPA itself from
+#      the .xcarchive (Payload zip). It fails hard if no archive was
+#      produced at all.
 #   5. Publishes the IPA to this fork's Releases under the rolling tag
 #      `unlocked-ios` (one stable download URL, updated on every build).
 #
@@ -176,25 +174,14 @@ jobs:
           }
           echo "Unlock patch applied: CLOUD_SYNC_REQUIRES_PREMIUM -> false"
 
-          # ─── signing-off patch: build without an Apple Developer account ───
-          # Insert right after every DEVELOPMENT_TEAM line (the settingGroups
-          # block all targets inherit), preserving indentation. tauri runs
-          # `xcodegen generate` from project.yml on each build, so the patched
-          # YAML flows into the regenerated pbxproj.
-          perl -i -pe 's/^(\s*)(DEVELOPMENT_TEAM:.*)$/$1$2\n${1}CODE_SIGNING_ALLOWED: NO\n${1}CODE_SIGN_IDENTITY: ""/' \
-            src-tauri/gen/apple/project.yml
-          grep -q 'CODE_SIGNING_ALLOWED: NO' src-tauri/gen/apple/project.yml || {
-            echo '::error::signing-off patch did not apply — upstream changed src-tauri/gen/apple/project.yml; update this step'
-            exit 1
-          }
-          echo "Code signing disabled: CODE_SIGNING_ALLOWED=NO"
-
+          # ─── build unsigned: tauri's --no-sign passes CODE_SIGNING_ALLOWED=NO
+          # and CODE_SIGN_IDENTITY="" to xcodebuild, then packages the
+          # unsigned IPA itself from the xcarchive (gen/apple/build/<arch>/).
+          # NOTE: patching project.yml is pointless here — `tauri ios build`
+          # does NOT re-run xcodegen; it uses the committed .pbxproj as-is.
           rm -rf src-tauri/gen/apple/build
-          # The export stage may abort on missing signing certificates even
-          # with signing disabled; the xcarchive completes before that, so a
-          # non-zero exit is tolerated and handled below.
-          pnpm tauri ios build --target aarch64-apple-ios || \
-            echo "::warning::tauri ios build exited non-zero (expected without signing certs) — packaging the archive manually"
+          pnpm tauri ios build --target aarch64-apple-ios --no-sign || \
+            echo "::warning::tauri ios build exited non-zero — packaging the archive manually"
 
           out_ipa="Readest_${version}_unlocked_ios_arm64.ipa"
           ipa=$(find src-tauri/gen/apple/build -type f -name '*.ipa' 2>/dev/null | head -n1)
